@@ -5,7 +5,7 @@
 [![k6](https://img.shields.io/badge/k6-v0.45+-blue?logo=k6)](https://k6.io)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-📖 **[Documentación completa → GitHub Pages](https://tu-usuario.github.io/k6-httpx)**
+📖 **[Documentación completa → GitHub Pages](https://ymanzon.github.io/k6-httpx)**
 
 ---
 
