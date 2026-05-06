@@ -81,11 +81,12 @@ const _session = {
     },
 
     apply(headers) {
+        // B-05 fix: return a NEW object — never mutate the caller's headers
+        var merged = Object.assign({}, headers, this.extraHeaders);
         if (this.token) {
-            headers[this.header] = `${this.prefix} ${this.token}`.trim();
+            merged[this.header] = (this.prefix + " " + this.token).trim();
         }
-        Object.assign(headers, this.extraHeaders);
-        return headers;
+        return merged;
     }
 };
 
@@ -133,12 +134,17 @@ function _buildUrl(base, params) {
 }
 
 function _resolvePath(obj, path) {
+    // B-02: guard against null/undefined obj or empty/invalid path
+    if (obj === null || obj === undefined) return undefined;
+    if (typeof path !== "string" || path === "") return undefined;
     return path.split(".").reduce(function(acc, key) {
         if (acc === null || acc === undefined) return undefined;
+        // Root array index: "[0]"
         var rootIdx = key.match(/^\[(\d+)\]$/);
         if (rootIdx) {
             return Array.isArray(acc) ? acc[parseInt(rootIdx[1], 10)] : undefined;
         }
+        // Property + array index: "items[2]"
         var propIdx = key.match(/^(.+)\[(\d+)\]$/);
         if (propIdx) {
             var prop = acc[propIdx[1]];
@@ -165,6 +171,126 @@ function _typeName(value) {
 function _env(key, defaultValue) {
     if (defaultValue === undefined) defaultValue = "";
     return (typeof __ENV !== "undefined" && __ENV[key]) ? __ENV[key] : defaultValue;
+}
+
+
+/* ═══════════════════════════════════════════════════
+   XML PARSER
+   indexOf-based — reliable across all k6/Goja versions.
+   No regex [\s\S] that breaks in some JS engines.
+
+   Supported paths:
+     "code"                  → <code>value</code>   (search in full body)
+     "OLS.code"              → <OLS>…<code>…</OLS>
+     "OLS.auth"              → <OLS>…<auth />…</OLS>  (self-closing → "")
+     "channel.item[0].title" → first <item>'s <title>
+════════════════════════════════════════════════════ */
+
+/**
+ * Extracts the inner text of the first (or Nth) matching tag from an XML string.
+ * Handles self-closing tags (<tag />) returning "" and regular tags returning content.
+ * @param {string} xml  — XML source string
+ * @param {string} tag  — tag name (no angle brackets)
+ * @param {number} idx  — -1 for first match, 0..N for Nth match
+ * @returns {string|undefined}
+ */
+function _xmlExtractTag(xml, tag, idx) {
+    var openTag  = "<" + tag;
+    var closeTag = "</" + tag + ">";
+    var count    = 0;
+    var pos      = 0;
+
+    while (pos < xml.length) {
+        var start = xml.indexOf(openTag, pos);
+        if (start === -1) break;
+
+        // Guard against partial tag matches e.g. <codeExtra> when looking for <code>
+        var charAfter = start + openTag.length < xml.length
+            ? xml[start + openTag.length]
+            : "";
+        if (charAfter !== " " && charAfter !== ">" &&
+            charAfter !== "/" && charAfter !== "\t" &&
+            charAfter !== "\n" && charAfter !== "\r") {
+            pos = start + 1;
+            continue;
+        }
+
+        // Find the closing ">" of the opening tag
+        var gtPos = xml.indexOf(">", start);
+        if (gtPos === -1) { pos = start + 1; continue; }
+
+        // Self-closing tag: <tag/> or <tag attr="…"/>
+        if (xml[gtPos - 1] === "/") {
+            if (idx < 0 || count === idx) {
+                return ""; // present but empty
+            }
+            count++;
+            pos = gtPos + 1;
+            continue;
+        }
+
+        // Regular tag — find closing counterpart
+        var closePos = xml.indexOf(closeTag, gtPos + 1);
+        if (closePos === -1) { pos = start + 1; continue; }
+
+        if (idx < 0 || count === idx) {
+            return xml.substring(gtPos + 1, closePos);
+        }
+
+        count++;
+        pos = closePos + closeTag.length;
+    }
+    return undefined;
+}
+
+/**
+ * Resolves a dot-notation XML path against an XML string.
+ * Returns the trimmed text content, "" for self-closing, undefined if not found.
+ *
+ * Examples:
+ *   _xmlGetValue(xml, "OLS.code")              → "07"
+ *   _xmlGetValue(xml, "OLS.auth")              → ""  (self-closing)
+ *   _xmlGetValue(xml, "OLS.errorDesc")         → "SERVICIO NO DISPONIBLE"
+ *   _xmlGetValue(xml, "channel.item[0].title") → "First Post"
+ */
+function _xmlGetValue(xml, path) {
+    if (!xml || !path) return undefined;
+
+    var parts   = path.split(".");
+    var current = xml;
+
+    for (var i = 0; i < parts.length; i++) {
+        if (current === undefined || current === null) return undefined;
+        current = String(current);
+
+        var part     = parts[i];
+        var arrMatch = part.match(/^(.+)\[(\d+)\]$/);
+        var tag      = arrMatch ? arrMatch[1] : part;
+        var idx      = arrMatch ? parseInt(arrMatch[2], 10) : -1;
+
+        var extracted = _xmlExtractTag(current, tag, idx);
+        if (extracted === undefined) return undefined;
+        current = extracted;
+    }
+
+    // Strip any child tags remaining and return trimmed text
+    return current.replace(/<[^>]*>/g, "").trim();
+}
+
+/**
+ * Reads an attribute value from a specific tag in an XML string.
+ * _xmlGetAttr(xml, "OLS", "version") → "1.0"
+ */
+function _xmlGetAttr(xml, tag, attr) {
+    var tagStart = xml.indexOf("<" + tag);
+    if (tagStart === -1) return undefined;
+    var tagEnd = xml.indexOf(">", tagStart);
+    if (tagEnd === -1) return undefined;
+    var tagStr = xml.substring(tagStart, tagEnd + 1);
+    // Match attr="value" or attr='value'
+    var re = new RegExp(attr + '=["\']([^"\']*)["\']');
+    var m  = tagStr.match(re);
+    return m ? m[1] : undefined;
 }
 
 /* ═══════════════════════════════════════════════════
@@ -313,67 +439,190 @@ class HttpxResponse {
         return this;
     }
 
-    /* ── XML assertion ─────────────────────────── */
+    /* ── XML assertions ────────────────────────── */
 
-    expectXML(tags) {
+    /**
+     * Validates tag => value pairs in an XML response body.
+     * Works exactly like expectJSON() but for XML.
+     *
+     * Supports dot-notation paths and array index notation:
+     *   "title"           → <title>...</title>
+     *   "channel.title"   → <channel><title>...</title></channel>
+     *   "item[0].title"   → first <item>'s <title>
+     *   "item[1].link"    → second <item>'s <link>
+     *
+     * httpx.get("/feed.xml")
+     *   .expectXML({
+     *     "channel.title":       "My Blog",
+     *     "channel.item[0].title": "First Post",
+     *   })
+     */
+    expectXML(expected) {
+        var body   = this.text();
+        var checks = {};
+        for (var k in expected) {
+            (function(path, val) {
+                checks[`xml.${path} === "${val}"`] = function() {
+                    var actual = _xmlGetValue(body, path);
+                    return actual === String(val);
+                };
+            })(k, expected[k]);
+        }
+        check(body, checks);
+        return this;
+    }
+
+    /**
+     * Checks that all listed tags are PRESENT in the XML body
+     * (legacy behavior — presence only, no value check).
+     *
+     * .expectXMLTags(["title", "link", "description"])
+     */
+    expectXMLTags(tags) {
         var body   = this.text();
         var checks = {};
         tags.forEach(function(t) {
-            checks[`xml <${t}> present`] = function() { return body.includes(`<${t}>`); };
+            checks[`xml <${t}> present`] = function() {
+                // Matches: <tag>, <tag attr="">, <tag/>, <tag />
+                return body.includes("<" + t + ">")
+                    || body.includes("<" + t + " ")
+                    || body.includes("<" + t + "/>")
+                    || body.includes("<" + t + "/>");
+            };
         });
         check(body, checks);
+        return this;
+    }
+
+    /**
+     * Checks that specific tags are EMPTY / self-closing in the XML body.
+     * Matches both <tag /> and <tag></tag> (empty content).
+     *
+     * .expectXMLEmpty(["auth", "amount", "messageTicket"])
+     */
+    expectXMLEmpty(tags) {
+        var body   = this.text();
+        var checks = {};
+        tags.forEach(function(t) {
+            checks[`xml <${t}> is empty`] = function() {
+                // Self-closing: <tag/> or <tag />
+                var selfClose = body.includes("<" + t + "/>") || body.includes("<" + t + " />");
+                // Empty with closing tag: <tag></tag>
+                var emptyPair = new RegExp("<" + t + "[^>]*>\s*<\/" + t + ">").test(body);
+                return selfClose || emptyPair;
+            };
+        });
+        check(body, checks);
+        return this;
+    }
+
+    /**
+     * Reads and returns a specific XML tag value using dot-notation.
+     * Useful for extracting XML values mid-chain.
+     *
+     * var title = res.xmlValue("channel.title");
+     */
+    xmlValue(path) {
+        return _xmlGetValue(this.text(), path);
+    }
+
+    /**
+     * Extracts XML tag values into the correlation store.
+     * Same API as .extract() but for XML responses.
+     *
+     * .extractXML({ feedTitle: "channel.title", firstItem: "channel.item[0].title" })
+     * httpx.var("feedTitle") → "My Blog"
+     */
+    extractXML(map) {
+        var body = this.text();
+        for (var storageKey in map) {
+            var path  = map[storageKey];
+            var value = _xmlGetValue(body, path);
+            if (value !== undefined) {
+                _correlationStore[storageKey] = value;
+            } else {
+                console.warn(`[httpx] extractXML: path "${path}" not found in XML`);
+            }
+        }
         return this;
     }
 
     /* ── Contract ──────────────────────────────── */
 
     /**
-     * Validates the JSON response shape against a type schema.
+     * Validates the JSON response shape using k6 check() — SOFT mode.
+     * Failures are recorded as failed checks (visible in CLI + dashboard)
+     * but do NOT stop the VU iteration. Use contractStrict() for hard-fail.
      *
      * - OBJECT response  → validates keys directly.
-     * - ARRAY  response  → validates the FIRST element automatically.
-     *   (covers list endpoints: GET /users → [{ id, name }, ...])
+     * - ARRAY  response  → validates the first element automatically.
      *
-     * Supported types: "string" | "number" | "boolean" | "object" | "array" | "null" | "any"
+     * Supported types: "string"|"number"|"boolean"|"object"|"array"|"null"|"any"
      *
      * httpx.get("/users").contract({ id: "number", name: "string" })
      * httpx.get("/users/1").contract({ id: "number", name: "string" })
      */
     contract(schema) {
-        var raw = this.json();
+        // B-03 fix: use check() so failures appear in k6 summary, not as exceptions
+        var raw    = this.json();
+        var prefix = "[" + this.meta.method + "] " + this.meta.url + " contract";
+        var checks = {};
 
         if (raw === null || raw === undefined) {
-            throw new Error("contract: response body is empty or not valid JSON");
-        }
-
-        if (Array.isArray(raw)) {
-            if (raw.length === 0) {
-                console.warn("[httpx] contract: empty array response, schema not validated");
-                return this;
-            }
-            var item = raw[0];
-            for (var k in schema) {
-                var value    = _resolvePath(item, k);
-                var expected = schema[k];
-                if (!_validateType(value, expected)) {
-                    throw new Error(
-                        `contract violation at [0]: "${k}" expected ${expected}, got ${_typeName(value)}`
-                    );
-                }
-            }
+            checks[prefix + ": body is valid JSON"] = function() { return false; };
+            check(null, checks);
             return this;
         }
 
-        if (typeof raw !== "object") {
-            throw new Error(`contract: expected object or array, got ${typeof raw}`);
+        var target = Array.isArray(raw) ? raw[0] : raw;
+
+        if (Array.isArray(raw) && raw.length === 0) {
+            console.warn("[httpx] contract: empty array — schema not validated");
+            return this;
         }
 
         for (var k in schema) {
-            var value    = _resolvePath(raw, k);
+            (function(key, expectedType) {
+                var val = _resolvePath(target, key);
+                checks[prefix + ": " + key + " is " + expectedType] = function() {
+                    return _validateType(val, expectedType);
+                };
+            })(k, schema[k]);
+        }
+        check(raw, checks);
+        return this;
+    }
+
+    /**
+     * Validates the JSON response shape — STRICT mode.
+     * Throws an Error on the first violation, stopping the iteration.
+     * Use contract() for soft/non-blocking validation.
+     *
+     * httpx.get("/users/1").contractStrict({ id: "number", name: "string" })
+     */
+    contractStrict(schema) {
+        var raw    = this.json();
+        var prefix = "[" + this.meta.method + "] " + this.meta.url;
+
+        if (raw === null || raw === undefined) {
+            throw new Error(prefix + " contract: body is empty or not valid JSON");
+        }
+
+        var target = Array.isArray(raw) ? raw[0] : raw;
+        if (Array.isArray(raw) && raw.length === 0) {
+            console.warn("[httpx] contractStrict: empty array — schema not validated");
+            return this;
+        }
+        if (typeof target !== "object" || target === null) {
+            throw new Error(prefix + " contract: target is not an object, got " + _typeName(target));
+        }
+
+        for (var k in schema) {
+            var value    = _resolvePath(target, k);
             var expected = schema[k];
             if (!_validateType(value, expected)) {
                 throw new Error(
-                    `contract violation: "${k}" expected ${expected}, got ${_typeName(value)}`
+                    prefix + " contract violation: " + k + " expected " + expected + ", got " + _typeName(value)
                 );
             }
         }
@@ -381,29 +630,65 @@ class HttpxResponse {
     }
 
     /**
-     * Validates that the response is an array AND that EVERY element
-     * matches the schema.
+     * Validates every element of an array response — SOFT mode (uses check()).
+     * Failures appear in k6 summary but don't stop the iteration.
      *
      * httpx.get("/users").contractArray({ id: "number", name: "string" })
      */
     contractArray(schema) {
-        var data = this.json();
+        // B-03 fix: use check() instead of throw
+        var data   = this.json();
+        var prefix = "[" + this.meta.method + "] " + this.meta.url + " contractArray";
+        var checks = {};
 
         if (!Array.isArray(data)) {
-            throw new Error(`contractArray: expected array, got ${typeof data}`);
+            checks[prefix + ": response is array"] = function() { return false; };
+            check(null, checks);
+            return this;
         }
 
-        data.forEach(function(item, index) {
+        for (var i = 0; i < data.length; i++) {
+            var item = data[i];
+            for (var k in schema) {
+                (function(idx, key, expectedType) {
+                    var val = _resolvePath(item, key);
+                    checks[prefix + "[" + idx + "]: " + key + " is " + expectedType] = function() {
+                        return _validateType(val, expectedType);
+                    };
+                })(i, k, schema[k]);
+            }
+        }
+        check(data, checks);
+        return this;
+    }
+
+    /**
+     * Validates every element of an array response — STRICT mode.
+     * Throws on first violation. Use contractArray() for soft validation.
+     *
+     * httpx.get("/users").contractArrayStrict({ id: "number", name: "string" })
+     */
+    contractArrayStrict(schema) {
+        var data   = this.json();
+        var prefix = "[" + this.meta.method + "] " + this.meta.url;
+
+        if (!Array.isArray(data)) {
+            throw new Error(prefix + " contractArrayStrict: expected array, got " + typeof data);
+        }
+
+        for (var i = 0; i < data.length; i++) {
+            var item = data[i];
             for (var k in schema) {
                 var value    = _resolvePath(item, k);
                 var expected = schema[k];
                 if (!_validateType(value, expected)) {
                     throw new Error(
-                        `contractArray violation at [${index}]: "${k}" expected ${expected}, got ${_typeName(value)}`
+                        prefix + " contractArrayStrict violation at [" + i + "]: " + k +
+                        " expected " + expected + ", got " + _typeName(value)
                     );
                 }
             }
-        });
+        }
         return this;
     }
 
@@ -494,7 +779,10 @@ function _request(method, url, body, params) {
     _metricDuration.add(res.timings.duration, tags);
     _metricSuccess.add(res.status < 400 ? 1 : 0, tags);
 
-    _timeline.push({ method: method, url: fullUrl, status: res.status, duration: res.timings.duration });
+    // B-06 fix: include VU and iteration so printTimeline is useful in multi-VU runs
+    var _vu   = typeof __VU   !== "undefined" ? __VU   : 0;
+    var _iter = typeof __ITER !== "undefined" ? __ITER : 0;
+    _timeline.push({ vu: _vu, iter: _iter, method: method, url: fullUrl, status: res.status, duration: res.timings.duration });
     _reportData.push({ method: method, url: fullUrl, status: res.status, duration: res.timings.duration });
 
     if (res.status === 429) {
@@ -546,7 +834,9 @@ function _parallelBatch(requests) {
         _metricRequests.add(1, tags);
         _metricDuration.add(res.timings.duration, tags);
         _metricSuccess.add(res.status < 400 ? 1 : 0, tags);
-        _timeline.push({ method: method, url: url, status: res.status, duration: res.timings.duration });
+        var _pvu   = typeof __VU   !== "undefined" ? __VU   : 0;
+        var _piter = typeof __ITER !== "undefined" ? __ITER : 0;
+        _timeline.push({ vu: _pvu, iter: _piter, method: method, url: url, status: res.status, duration: res.timings.duration });
         _reportData.push({ method: method, url: url, status: res.status, duration: res.timings.duration });
         return new HttpxResponse(res, { method: method, url: url, headers: params.headers, body: body });
     });
@@ -557,27 +847,37 @@ function _parallelBatch(requests) {
 ═══════════════════════════════════════════════════ */
 
 function _retryWithBackoff(fn, options) {
-    if (options === undefined) options = {};
-    var retries   = options.retries   !== undefined ? options.retries   : 3;
-    var baseDelay = options.baseDelay !== undefined ? options.baseDelay : 1;
-    var factor    = options.factor    !== undefined ? options.factor    : 2;
-    var maxDelay  = options.maxDelay  !== undefined ? options.maxDelay  : 30;
+    // B-04 fix: use for loop with explicit lastError — correct return in all code paths
+    var opts      = options || {};
+    var retries   = opts.retries   !== undefined ? opts.retries   : 3;
+    var baseDelay = opts.baseDelay !== undefined ? opts.baseDelay : 1;
+    var factor    = opts.factor    !== undefined ? opts.factor    : 2;
+    var maxDelay  = opts.maxDelay  !== undefined ? opts.maxDelay  : 30;
 
-    var attempt = 0;
-    while (attempt < retries) {
+    // Ensure at least 1 attempt
+    if (retries < 1) retries = 1;
+
+    var lastError;
+    for (var attempt = 0; attempt < retries; attempt++) {
         try {
+            // If fn() returns a value, it propagates correctly via return
             return fn();
         } catch (err) {
-            attempt++;
-            if (attempt >= retries) {
-                console.error(`[httpx] retry: all ${retries} attempts failed — ${err.message}`);
-                throw err;
+            lastError = err;
+            if (attempt < retries - 1) {
+                // Exponential backoff: delay = baseDelay * factor^attempt (capped at maxDelay)
+                var delay = Math.min(baseDelay * Math.pow(factor, attempt), maxDelay);
+                console.warn(
+                    "[httpx] retry " + (attempt + 1) + "/" + retries +
+                    " failed — waiting " + delay.toFixed(2) + "s. " + err.message
+                );
+                sleep(delay);
             }
-            var delay = Math.min(baseDelay * Math.pow(factor, attempt - 1), maxDelay);
-            console.warn(`[httpx] retry attempt ${attempt}/${retries} — waiting ${delay.toFixed(2)}s`);
-            sleep(delay);
         }
     }
+    // All retries exhausted — throw the last error
+    console.error("[httpx] retry: all " + retries + " attempts failed — " + lastError.message);
+    throw lastError;
 }
 
 /* ═══════════════════════════════════════════════════
@@ -834,12 +1134,31 @@ export const httpx = {
     /* ── Timeline ──────────────────────────────── */
 
     printTimeline: function() {
-        console.log("\n── TIMELINE ─────────────────────────────");
+        // B-06 fix: group by VU and show iter number
+        console.log("\n── TIMELINE ─────────────────────────────────────────");
+        var byVu = {};
         _timeline.forEach(function(t) {
-            var mark = t.status < 400 ? "✔" : "✘";
-            console.log(`  ${mark} ${t.method.padEnd(7)} ${t.status}  ${t.duration.toFixed(1)}ms  ${t.url}`);
+            var key = "VU" + (t.vu || 0);
+            if (!byVu[key]) byVu[key] = [];
+            byVu[key].push(t);
         });
-        console.log("─────────────────────────────────────────");
+        var vuKeys = Object.keys(byVu).sort();
+        vuKeys.forEach(function(vuKey) {
+            console.log("  " + vuKey + ":");
+            byVu[vuKey].forEach(function(t) {
+                var mark = t.status < 400 ? "✔" : "✘";
+                var iter = t.iter !== undefined ? " [iter " + t.iter + "]" : "";
+                console.log(
+                    "    " + mark + " " + t.method.padEnd(7) +
+                    " " + t.status +
+                    "  " + t.duration.toFixed(1) + "ms" +
+                    iter +
+                    "  " + t.url
+                );
+            });
+        });
+        console.log("─────────────────────────────────────────────────────");
+        console.log("  Total: " + _timeline.length + " requests");
     },
 
     /* ── Cookie Jar ────────────────────────────── */
@@ -864,6 +1183,66 @@ export const httpx = {
      */
     reportHtml: function() {
         return _buildReport();
+    },
+
+    /* ── Export ────────────────────────────────────── */
+
+    /**
+     * Exports all collected request data as a structured object.
+     * Use with handleSummary + dashboard plugin:
+     *
+     *   import { htmlReport } from "./helpers/k6.httpx.dashboard.js";
+     *   export function handleSummary(data) {
+     *     return { "report.html": htmlReport(data, { script: "my-script.js" }) };
+     *   }
+     *
+     * Returns: { meta, requests, metricNames }
+     */
+    exportResults: function() {
+        var total  = _reportData.length;
+        var passed = 0;
+        var failed = 0;
+        var sorted = [];
+
+        for (var i = 0; i < _reportData.length; i++) {
+            var r = _reportData[i];
+            if (r.status >= 200 && r.status < 400) { passed++; } else { failed++; }
+            sorted.push(r.duration);
+        }
+        sorted.sort(function(a, b) { return a - b; });
+
+        function pct(p) {
+            if (!sorted.length) return 0;
+            var idx = Math.ceil((p / 100) * sorted.length) - 1;
+            return sorted[idx < 0 ? 0 : idx];
+        }
+
+        var sum  = 0;
+        for (var j = 0; j < sorted.length; j++) sum += sorted[j];
+        var avgMs = total ? sum / total : 0;
+
+        var metricNames = [];
+        for (var name in _customMetrics) { metricNames.push(name); }
+
+        return {
+            meta: {
+                generatedAt:   new Date().toISOString(),
+                totalRequests: total,
+                passed:        passed,
+                failed:        failed,
+                passRate:      total ? parseFloat((passed / total * 100).toFixed(2)) : 0,
+                failRate:      total ? parseFloat((failed / total * 100).toFixed(2)) : 0,
+                avgMs:         parseFloat(avgMs.toFixed(2)),
+                minMs:         total ? parseFloat(sorted[0].toFixed(2)) : 0,
+                maxMs:         total ? parseFloat(sorted[sorted.length - 1].toFixed(2)) : 0,
+                p50Ms:         parseFloat(pct(50).toFixed(2)),
+                p90Ms:         parseFloat(pct(90).toFixed(2)),
+                p95Ms:         parseFloat(pct(95).toFixed(2)),
+                p99Ms:         parseFloat(pct(99).toFixed(2)),
+            },
+            requests:    _reportData.slice(),
+            metricNames: metricNames,
+        };
     }
 
 };
