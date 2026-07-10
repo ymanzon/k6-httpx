@@ -71,6 +71,14 @@ const _session = {
         this.prefix = prefix;
     },
 
+    setContentType(type) {
+        this.setHeader("Content-Type", type);
+    },
+
+    setUserAgent(ua) {
+        this.setHeader("User-Agent", ua);
+    },
+
     setHeader(name, value) {
         this.extraHeaders[name] = value;
     },
@@ -425,6 +433,189 @@ class HttpxResponse {
         return this;
     }
 
+    expectJSONArrayLength(path, length) {
+        var data   = this.json();
+        var checks = {};
+        checks[`json.${path} length === ${length}`] = function() {
+            var arr = _resolvePath(data, path);
+            return Array.isArray(arr) && arr.length === length;
+        };
+        check(data, checks);
+        return this;
+    }
+
+    //expect que recibe un path tipo array
+    //valida si es array
+    //valida el esquema de todos los valores del array
+    //valida si un elemento esta incluido en el array
+    //valida si un elemento es requerido en el array
+    //Supported types: "string"|"number"|"boolean"|"object"|"array"|"null"|"any"
+    expectContractArray(path, schema) {
+        var data   = this.json();
+        var checks = {};
+        var checks_schema = {};
+        //var prefix = "[" + this.meta.method + "] " + this.meta.url + " contractArray";
+        var prefix = `json.${path}`;
+        var requiredFail = false;
+
+
+        //checks[`json.${path} is array`] = function() {
+            var arr = _resolvePath(data, path);
+
+        if (!Array.isArray(arr)) {
+            checks[prefix + ": response is array"] = function() { return false; };
+            check(null, checks);
+            return this;
+        }
+
+            //if (!Array.isArray(arr)) return false;
+
+            var allValid = true;
+            var anyValid = false;
+            var fieldNotFound = false;
+
+        var fieldIsNotValid = false;
+
+            for (var k in schema) {
+                var checkLabel = prefix + ": " + k + " is " + schema[k];
+            for (var i = 0; i < arr.length; i++) {
+                var item = arr[i];
+                //(i, k, schema[k]);
+                var idx = i;
+                var key = k;
+                var expectedType = schema[k];
+                //(function(idx, key, expectedType){
+                    var val = _resolvePath(item, key);
+                   // var checkLabel = prefix +"[" + idx + "]." + key + " is " + expectedType;
+                    var isValid = _validateType(val, expectedType);
+                    //validar que k contiene al final del texto el caracter '!' aplicando que es importante o requerido
+                    //si no lo contiene, es opcional 
+                    var isRequired = k.endsWith("?");
+
+                    //validar primero si se encuentra el key 
+                    if(val === undefined)
+                    {
+                        //console.error(`check ${checkLabel} no se encuentra el campo,${val}`);
+                        //no se encuentra, y es requerido
+                        if(isRequired)
+                        {
+                            //console.error(`check ${checkLabel} es requerido y no se encuentra el campo, ${val}`);
+                            requiredFail = true;
+                            break;
+                        }
+                    }else
+                    {
+                        console.log(`check ${checkLabel} se encuentra el campo, ${val}`);
+                    }
+
+                    // if(val == 'undefined')
+
+                   /* if(isValid){
+                        if(isRequired){
+                            console.log(`check ${checkLabel} es requerido`);
+                        }else {
+                            anyValid = true; //a
+                            //console.log(`check ${checkLabel} amenos un elemento es valido`);
+                        }
+                    }else{
+                        if(val == 'undefined')
+                            fieldNotFound = true;
+                        else
+                        //console.log(val);
+                            fieldIsNotValid = true;
+                        //console.log("no es valido");
+                        //checks[checkLabel + " no es valido"] = function() { return false; };
+                        break;
+                    }*/
+
+                    //si es requerido, entonces se valida que todos los elementos del array cumplan con el esquema, si es opcional, entonces se valida que al menos un elemento del array cumpla con el esquema
+                   /* if(isRequired){
+                        if(!isValid){
+                            checkLabel = `check ${checkLabel} is required`;
+                            allValid = false;
+                            break;    
+                        }else{
+
+                        }
+                        
+                    }else {
+                        console.log(`check ${checkLabel} is optional`);
+                    }*/
+
+                    
+
+                        //agregando validacion para requerido 
+                        //mientras que isvalid sea verdadera, se contnuara validando, si aparece un falso, entones marcaria el check como invalido
+                        /*if(!isValid)
+                        {
+                            console.log("no es valido");
+                            allValid = false;
+                            checks[checkLabel] = function() { return false; };
+                            break;
+                        }else 
+                            console.log("aun es valido");
+                            */
+                         
+                        //
+                        //if( !isValid ) continue;
+                        
+                        //checks[path + "[" + idx + "]." + key + " is " + val + " expected " + expectedType] = _validateType(val, expectedType);
+
+                        //console.log(val + " es " + _validateType(val, expectedType) + " y se espera " + expectedType);
+                        //checks[prefix + "[" + idx + "]: " + key + " is " + expectedType] = function() {
+                           // var result =  _validateType(val, expectedType);
+                            //console.log(`Checking item [${idx}] key "${key}": expected ${expectedType}, got ${_typeName(val)} — ${result ? "PASS" : "FAIL"}`);
+                            //return result;
+                        //};
+                    //})(i, k, schema[k]);
+
+                    //if(fieldIsNotValid == true)
+                     //   checks[checkLabel + " no es valido"] = function() { return false; };
+
+                    //if(allValid === false)
+                    //    checks[checkLabel] = function() { return false; };
+                    
+
+                    /*
+                    var val = _resolvePath(item, k);
+                    if (val === undefined) {
+                        return false; // required field missing
+                    }
+                    if (!_validateType(val, schema[k])) {
+                        return false; // type mismatch
+                    }
+*/
+                }
+
+                if(requiredFail)
+                {
+                    checks[checkLabel + ": required field missing"] = function() { return false; };
+                    //checks[checkLabel] = function() { return false; };
+                }
+
+                /*
+                if(anyValid == true)
+                    checks[prefix + ": OK "] = function() { return true; };
+                else{
+                    checks[prefix + ": ningun item es valido"] = function() { return false; };
+                }
+                */
+                /*if(allValid === false){
+                    console.log("allValid: " + allValid);
+                }
+                else {
+                    console.log("allValid: " + allValid);
+                }*/
+            }
+            //return true;
+        //};
+        //console.log(checks);
+        //console.log(checks);
+        check(data, checks);
+        return this;
+    }
+
+    /*
     expectJSONSchema(schema) {
         var data   = this.json();
         var checks = {};
@@ -437,7 +628,7 @@ class HttpxResponse {
         }
         check(data, checks);
         return this;
-    }
+    }*/
 
     /* ── XML assertions ────────────────────────── */
 
@@ -989,7 +1180,9 @@ export const httpx = {
     session: {
         setToken:   function(token, header, prefix) { _session.setToken(token, header, prefix); },
         setHeader:  function(name, value)            { _session.setHeader(name, value); },
-        clearToken: function()                       { _session.clearToken(); }
+        clearToken: function()                       { _session.clearToken(); },
+        setContentType: function(type='application/json') { _session.setContentType(type); },
+        setUserAgent: function(ua='k6-test-suites')                     { _session.setUserAgent(ua); }
     },
 
     /* ── Config ────────────────────────────────── */
