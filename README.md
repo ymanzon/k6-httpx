@@ -51,7 +51,7 @@ httpx.get("/users")
 
 ```bash
 # Clonar el repo
-git clone https://github.com/tu-usuario/k6-httpx.git
+git clone https://github.com/ymanzon/k6-httpx.git
 
 # O solo copiar la librería a tu proyecto
 cp helpers/k6.httpx.js tu-proyecto/helpers/
