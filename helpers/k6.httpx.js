@@ -433,6 +433,11 @@ class HttpxResponse {
         return this;
     }
 
+    sleep(seconds = 1) {
+        sleep(seconds);
+        return this;
+    }
+
     expectJSONArrayLength(path, length) {
         var data   = this.json();
         var checks = {};
