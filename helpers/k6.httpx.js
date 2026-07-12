@@ -432,7 +432,8 @@ class HttpxResponse {
         check(data, checks);
         return this;
     }
-
+  
+    /** Define el tiempo qu se queda esperando luego de ejecutar la instruccion */
     sleep(seconds = 1) {
         sleep(seconds);
         return this;
